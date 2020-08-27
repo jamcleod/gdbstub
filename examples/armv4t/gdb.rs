@@ -1,8 +1,8 @@
 use armv4t_emu::{reg, Memory};
-use gdbstub::{
-    arch, Actions, BreakOp, OptResult, ResumeAction, StopReason, Target, Tid, WatchKind,
-    SINGLE_THREAD_TID,
-};
+use gdbstub::arch;
+use gdbstub::target::base::{ResumeAction, StopReason};
+use gdbstub::target::ext::breakpoint::{BreakOp, WatchKind};
+use gdbstub::target::{base, ext, Target};
 
 use crate::emu::{Emu, Event};
 
@@ -10,18 +10,29 @@ impl Target for Emu {
     type Arch = arch::arm::Armv4t;
     type Error = &'static str;
 
+    fn base_ops(&mut self) -> base::BaseOps<Self::Arch, Self::Error> {
+        base::BaseOps::SingleThread(self)
+    }
+
+    fn sw_breakpoint(&mut self) -> ext::SwBreakpointExt<Self> {
+        self
+    }
+
+    fn hw_watchpoint(&mut self) -> Option<ext::HwWatchpointExt<Self>> {
+        Some(self)
+    }
+}
+
+impl base::SingleThread for Emu {
     fn resume(
         &mut self,
-        mut actions: Actions,
+        action: ResumeAction,
         check_gdb_interrupt: &mut dyn FnMut() -> bool,
-    ) -> Result<(Tid, StopReason<u32>), Self::Error> {
-        // only one thread, only one action
-        let (_, action) = actions.next().unwrap();
-
+    ) -> Result<StopReason<u32>, Self::Error> {
         let event = match action {
             ResumeAction::Step => match self.step() {
                 Some(e) => e,
-                None => return Ok((SINGLE_THREAD_TID, StopReason::DoneStep)),
+                None => return Ok(StopReason::DoneStep),
             },
             ResumeAction::Continue => {
                 let mut cycles = 0;
@@ -33,27 +44,24 @@ impl Target for Emu {
                     // check for GDB interrupt every 1024 instructions
                     cycles += 1;
                     if cycles % 1024 == 0 && check_gdb_interrupt() {
-                        return Ok((SINGLE_THREAD_TID, StopReason::GdbInterrupt));
+                        return Ok(StopReason::GdbInterrupt);
                     }
                 }
             }
         };
 
-        Ok((
-            SINGLE_THREAD_TID,
-            match event {
-                Event::Halted => StopReason::Halted,
-                Event::Break => StopReason::HwBreak,
-                Event::WatchWrite(addr) => StopReason::Watch {
-                    kind: WatchKind::Write,
-                    addr,
-                },
-                Event::WatchRead(addr) => StopReason::Watch {
-                    kind: WatchKind::Read,
-                    addr,
-                },
+        Ok(match event {
+            Event::Halted => StopReason::Halted,
+            Event::Break => StopReason::HwBreak,
+            Event::WatchWrite(addr) => StopReason::Watch {
+                kind: WatchKind::Write,
+                addr,
             },
-        ))
+            Event::WatchRead(addr) => StopReason::Watch {
+                kind: WatchKind::Read,
+                addr,
+            },
+        })
     }
 
     fn read_registers(
@@ -100,7 +108,9 @@ impl Target for Emu {
         }
         Ok(true)
     }
+}
 
+impl ext::breakpoint::SwBreakpoint for Emu {
     fn update_sw_breakpoint(&mut self, addr: u32, op: BreakOp) -> Result<bool, &'static str> {
         match op {
             BreakOp::Add => self.breakpoints.push(addr),
@@ -115,13 +125,15 @@ impl Target for Emu {
 
         Ok(true)
     }
+}
 
+impl ext::breakpoint::HwWatchpoint for Emu {
     fn update_hw_watchpoint(
         &mut self,
         addr: u32,
         op: BreakOp,
         kind: WatchKind,
-    ) -> OptResult<bool, &'static str> {
+    ) -> Result<bool, &'static str> {
         match op {
             BreakOp::Add => {
                 match kind {
